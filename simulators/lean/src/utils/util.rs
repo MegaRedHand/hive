@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::B256;
@@ -19,6 +20,7 @@ use hivesim::{
 };
 use reqwest::{header::ACCEPT, Client as HttpClient, Url};
 use serde::{de::DeserializeOwned, Deserialize};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 
 const HIVE_CHECK_LIVE_PORT: &str = "HIVE_CHECK_LIVE_PORT";
@@ -175,8 +177,41 @@ pub(crate) struct TimedDataTestSpec<T> {
     pub description: String,
     pub always_run: bool,
     pub client_name: String,
+    /// Budget for the setup phase, and then again for everything after it. See
+    /// [`mark_setup_complete`].
     pub timeout_duration: Duration,
     pub test_data: T,
+}
+
+tokio::task_local! {
+    /// Set for the duration of a data test body so setup helpers can mark the end of the slow
+    /// setup phase without the test having to thread anything through.
+    static SETUP_PHASE_SIGNAL: Arc<Notify>;
+}
+
+/// Marks the end of a test's slow setup phase, restarting its timeout budget for the work that
+/// follows.
+///
+/// Lean setup routinely spends minutes waiting on the LeanSpec helper to build and finalize a
+/// chain before the client under test is even queried. Charging that to the same budget as the
+/// assertions means a slow helper exhausts the budget before the test does anything, and the
+/// resulting timeout gets reported against the client. Setup helpers call this once they hand
+/// back a usable context, so the split is the default for every data test rather than something
+/// each test opts into.
+///
+/// A no-op outside a data test body. Only the first call per test has an effect.
+pub(crate) fn mark_setup_complete() {
+    let _ = SETUP_PHASE_SIGNAL.try_with(|signal| signal.notify_one());
+}
+
+/// Which phase a data test was in when its budget ran out.
+enum TestPhaseOutcome {
+    /// The body finished before either budget expired.
+    Finished(Result<(), tokio::task::JoinError>),
+    /// Setup signalled completion; the body still owes us its assertions.
+    SetupComplete,
+    /// The setup budget expired before any helper signalled.
+    SetupTimedOut,
 }
 
 pub(crate) fn lean_clients(clients: Vec<ClientDefinition>) -> Vec<ClientDefinition> {
@@ -728,7 +763,10 @@ pub(crate) async fn run_data_test_with_timeout<T: Send + 'static>(
     let suite = host_test.suite.clone();
     let simulation = host_test.sim.clone();
 
-    let mut join_handle = tokio::spawn(async move {
+    let setup_signal = Arc::new(Notify::new());
+    let body_signal = setup_signal.clone();
+
+    let mut join_handle = tokio::spawn(SETUP_PHASE_SIGNAL.scope(body_signal, async move {
         let mut test = Test {
             sim: simulation,
             test_id,
@@ -739,15 +777,52 @@ pub(crate) async fn run_data_test_with_timeout<T: Send + 'static>(
 
         test.result.pass = true;
         (func)(&mut test, test_data).await;
-    });
+    }));
 
-    let test_result = match timeout(timeout_duration, &mut join_handle).await {
-        Ok(join_result) => {
+    // Phase one covers everything up to the point a setup helper reports a usable context. Tests
+    // with no such helper never signal, so they simply run to completion under the single budget,
+    // exactly as before.
+    let setup_complete = setup_signal.notified();
+    tokio::pin!(setup_complete);
+
+    let phase = tokio::select! {
+        // Prefer reporting a finished body over a setup signal that landed in the same instant.
+        biased;
+        join_result = &mut join_handle => TestPhaseOutcome::Finished(join_result),
+        () = &mut setup_complete => TestPhaseOutcome::SetupComplete,
+        () = sleep(timeout_duration) => TestPhaseOutcome::SetupTimedOut,
+    };
+
+    let test_result = match phase {
+        TestPhaseOutcome::Finished(join_result) => {
             annotate_failed_client(extract_data_test_result(join_result), &client_name)
         }
-        Err(_) => {
+        // Setup handed back a context, so the assertions get the budget to themselves.
+        TestPhaseOutcome::SetupComplete => {
+            match timeout(timeout_duration, &mut join_handle).await {
+                Ok(join_result) => {
+                    annotate_failed_client(extract_data_test_result(join_result), &client_name)
+                }
+                Err(_) => {
+                    join_handle.abort();
+                    join_handle.await.ok();
+                    TestResult {
+                        pass: false,
+                        details: format!(
+                            "client {}: test exceeded timeout of {} seconds after setup completed",
+                            client_name,
+                            timeout_duration.as_secs()
+                        ),
+                    }
+                }
+            }
+        }
+        TestPhaseOutcome::SetupTimedOut => {
             join_handle.abort();
             join_handle.await.ok();
+            // Register an attribution client anyway: hiveview's per-client filter needs one to
+            // list this failure at all. The details make clear the client is named only to say
+            // it was never exercised.
             register_timeout_client_for_failed_setup(
                 host_test.sim.clone(),
                 suite_id,
@@ -758,9 +833,10 @@ pub(crate) async fn run_data_test_with_timeout<T: Send + 'static>(
             TestResult {
                 pass: false,
                 details: format!(
-                    "client {}: test exceeded timeout of {} seconds",
+                    "setup exceeded timeout of {} seconds before client {} was exercised \
+                     (harness setup, not a client assertion)",
+                    timeout_duration.as_secs(),
                     client_name,
-                    timeout_duration.as_secs()
                 ),
             }
         }
@@ -954,4 +1030,37 @@ pub(crate) fn simulator_container_ip() -> IpAddr {
             panic!("Unable to determine simulator container local socket address: {err}")
         })
         .ip()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The signal has to reach helpers called (transitively) from a test body, since that is how
+    /// setup marks its own end without every test threading a handle through.
+    #[tokio::test]
+    async fn mark_setup_complete_reaches_the_running_test_body() {
+        let signal = Arc::new(Notify::new());
+        let observed = signal.clone();
+
+        let body = SETUP_PHASE_SIGNAL.scope(signal, async {
+            async fn nested_setup_helper() {
+                mark_setup_complete();
+            }
+            nested_setup_helper().await;
+        });
+        tokio::spawn(body).await.expect("test body panicked");
+
+        // `notify_one` leaves a permit behind, so this resolves even though the body already
+        // finished. Without the signal reaching the helper it would hang and trip the timeout.
+        timeout(Duration::from_secs(5), observed.notified())
+            .await
+            .expect("setup completion signal never arrived");
+    }
+
+    /// Suites whose setup never signals must keep the single-budget behaviour rather than fail.
+    #[tokio::test]
+    async fn mark_setup_complete_is_a_no_op_outside_a_test_body() {
+        mark_setup_complete();
+    }
 }

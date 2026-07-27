@@ -10,11 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::utils::util::{
     bootnode_enr_for_client, client_uses_enr_bootnodes, current_unix_time, default_genesis_time,
-    fork_choice_head_slot, http_client, lean_api_url, lean_environment, panic_payload_to_string,
-    prepare_client_runtime_files, selected_lean_devnet, simulator_container_ip, CheckpointResponse,
-    ClientUnderTestRole, ForkChoiceResponse, ForkChoiceSnapshot, LeanDevnet,
-    DEVNET4_HELPER_GOSSIP_FORK_DIGEST, LEAN_HELPER_ADVERTISE_IP_ENVIRONMENT_VARIABLE,
-    LEAN_HELPER_API_PORT_ENVIRONMENT_VARIABLE, LEAN_HELPER_GOSSIP_FORK_DIGEST_ENVIRONMENT_VARIABLE,
+    fork_choice_head_slot, http_client, lean_api_url, lean_environment, mark_setup_complete,
+    panic_payload_to_string, prepare_client_runtime_files, selected_lean_devnet,
+    simulator_container_ip, CheckpointResponse, ClientUnderTestRole, ForkChoiceResponse,
+    ForkChoiceSnapshot, LeanDevnet, DEVNET4_HELPER_GOSSIP_FORK_DIGEST,
+    LEAN_HELPER_ADVERTISE_IP_ENVIRONMENT_VARIABLE, LEAN_HELPER_API_PORT_ENVIRONMENT_VARIABLE,
+    LEAN_HELPER_GOSSIP_FORK_DIGEST_ENVIRONMENT_VARIABLE,
     LEAN_HELPER_IDENTITY_PRIVATE_KEY_ENVIRONMENT_VARIABLE,
     LEAN_HELPER_METADATA_PORT_ENVIRONMENT_VARIABLE, LEAN_HELPER_P2P_PORT_ENVIRONMENT_VARIABLE,
 };
@@ -1110,6 +1111,10 @@ pub(crate) async fn start_checkpoint_sync_client_context(
         None
     };
 
+    // Everything above is helper-bound setup, not a check on the client under test. Hand the
+    // remaining budget to whatever the caller asserts next.
+    mark_setup_complete();
+
     PostGenesisSyncContext {
         _helpers: helper_mesh.helpers,
         client_under_test,
@@ -1441,6 +1446,10 @@ async fn start_post_genesis_sync_context_inner(
     } else {
         None
     };
+
+    // Everything above is helper-bound setup, not a check on the client under test. Hand the
+    // remaining budget to whatever the caller asserts next.
+    mark_setup_complete();
 
     PostGenesisSyncContext {
         _helpers: helpers,
