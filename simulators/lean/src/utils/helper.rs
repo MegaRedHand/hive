@@ -10,16 +10,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::utils::util::{
     bootnode_enr_for_client, client_uses_enr_bootnodes, current_unix_time, default_genesis_time,
-    fork_choice_head_slot, http_client, lean_api_url, lean_environment, panic_payload_to_string,
-    prepare_client_runtime_files, selected_lean_devnet, simulator_container_ip, CheckpointResponse,
-    ClientUnderTestRole, ForkChoiceResponse, ForkChoiceSnapshot, LeanDevnet,
-    DEVNET4_HELPER_GOSSIP_FORK_DIGEST, LEAN_HELPER_ADVERTISE_IP_ENVIRONMENT_VARIABLE,
-    LEAN_HELPER_API_PORT_ENVIRONMENT_VARIABLE, LEAN_HELPER_GOSSIP_FORK_DIGEST_ENVIRONMENT_VARIABLE,
+    extract_data_test_result, fork_choice_head_slot, http_client, lean_api_url, lean_environment,
+    panic_payload_to_string, prepare_client_runtime_files, selected_lean_devnet,
+    simulator_container_ip, CheckpointResponse, ClientUnderTestRole, ForkChoiceResponse,
+    ForkChoiceSnapshot, LeanDevnet, DEVNET4_HELPER_GOSSIP_FORK_DIGEST,
+    LEAN_HELPER_ADVERTISE_IP_ENVIRONMENT_VARIABLE, LEAN_HELPER_API_PORT_ENVIRONMENT_VARIABLE,
+    LEAN_HELPER_GOSSIP_FORK_DIGEST_ENVIRONMENT_VARIABLE,
     LEAN_HELPER_IDENTITY_PRIVATE_KEY_ENVIRONMENT_VARIABLE,
     LEAN_HELPER_METADATA_PORT_ENVIRONMENT_VARIABLE, LEAN_HELPER_P2P_PORT_ENVIRONMENT_VARIABLE,
 };
-use hivesim::types::ClientDefinition;
-use hivesim::{Client, Test};
+use hivesim::types::{ClientDefinition, TestResult};
+use hivesim::{Client, SharedClientScenario, Test};
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
 
@@ -1185,6 +1186,286 @@ pub(crate) async fn start_post_genesis_sync_context_with_extra_bootnodes_after_h
     extra_bootnodes: Vec<String>,
 ) -> PostGenesisSyncContext {
     start_post_genesis_sync_context_inner(test, test_data, extra_bootnodes, true).await
+}
+
+/// Read-only snapshot of the shared post-genesis setup, handed to every scenario.
+#[derive(Clone)]
+pub(crate) struct SharedPostGenesisData {
+    pub source_fork_choice: ForkChoiceSnapshot,
+    pub client_checkpoint: Option<CheckpointResponse>,
+}
+
+/// Runs several read-only scenarios against ONE post-genesis checkpoint-sync setup.
+///
+/// Building the LeanSpec helper chain and checkpoint-syncing the client under test is slow
+/// (~100-180s) and byte-identical across the post-genesis `rpc_compat` tests; paying that cost
+/// once and fanning the scenarios out against the resulting client keeps a slow *setup* from
+/// eating each scenario's own timeout budget, and keeps setup failures (a harness/helper
+/// problem) from being misattributed to the client under test.
+pub(crate) struct SharedPostGenesisTestSpec {
+    /// Name of the lifecycle-owner test shown in hiveview.
+    pub name: String,
+    pub description: String,
+    pub always_run: bool,
+    pub client_name: String,
+    /// Budget for building the LeanSpec helper chain and checkpoint-syncing the client.
+    pub setup_timeout: Duration,
+    /// Budget for one scenario's assertions, which run against the already-synced client.
+    pub scenario_timeout: Duration,
+    pub test_data: PostGenesisSyncTestData,
+    pub scenarios: Vec<SharedClientScenario<SharedPostGenesisData>>,
+}
+
+pub(crate) async fn run_shared_post_genesis_test(
+    host_test: &mut Test,
+    spec: SharedPostGenesisTestSpec,
+) {
+    let SharedPostGenesisTestSpec {
+        name,
+        description,
+        always_run,
+        client_name,
+        setup_timeout,
+        scenario_timeout,
+        test_data,
+        scenarios,
+    } = spec;
+
+    // Plan mode: record the owner and every scenario, then return without starting anything.
+    // `plan_test` is a no-op (and returns `false`) unless the simulation is planning, so this
+    // doubles as the "are we planning?" check.
+    if host_test.plan_test(&name, always_run) {
+        for scenario in &scenarios {
+            host_test.plan_test(&scenario.name, scenario.always_run);
+        }
+        return;
+    }
+
+    let suite_id = host_test.suite_id;
+    let suite = host_test.suite.clone();
+    let suite_name = suite.name.clone();
+
+    // Test-matcher filtering: skip entirely if neither the owner nor any scenario matches,
+    // otherwise filter the scenario list down to the matching ones.
+    let mut scenarios_filtered: usize = 0;
+    let scenarios = if let Some(test_match) = host_test.sim.test_matcher.clone() {
+        let owner_matches = always_run || test_match.match_test(&suite_name, &name);
+        if !owner_matches {
+            let any_scenario_matches = scenarios.iter().any(|scenario| {
+                scenario.always_run || test_match.match_test(&suite_name, &scenario.name)
+            });
+            if !any_scenario_matches {
+                return;
+            }
+        }
+
+        scenarios
+            .into_iter()
+            .filter(|scenario| {
+                if scenario.always_run || test_match.match_test(&suite_name, &scenario.name) {
+                    true
+                } else {
+                    scenarios_filtered += 1;
+                    false
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        scenarios
+    };
+
+    let owner_test_id = host_test
+        .sim
+        .start_test(suite_id, name.clone(), description.clone())
+        .await;
+
+    // Build the shared setup under `setup_timeout`. `start_post_genesis_sync_context` panics
+    // on failure rather than returning a `Result`, so run it inside a spawned task (to catch
+    // the panic) wrapped in a `timeout` (to bound the wait). The context it returns is kept
+    // alive for the rest of this function (RAII helper teardown happens when it finally drops).
+    let owner_test = Test {
+        sim: host_test.sim.clone(),
+        test_id: owner_test_id,
+        suite: suite.clone(),
+        suite_id,
+        result: Default::default(),
+    };
+
+    let mut setup_handle =
+        tokio::spawn(async move { start_post_genesis_sync_context(&owner_test, &test_data).await });
+
+    let setup_outcome = match timeout(setup_timeout, &mut setup_handle).await {
+        Ok(Ok(context)) => Ok(context),
+        Ok(Err(join_err)) => Err(panic_payload_to_string(join_err.into_panic())),
+        Err(_) => {
+            setup_handle.abort();
+            setup_handle.await.ok();
+            Err(format!(
+                "LeanSpec helper setup exceeded {} seconds",
+                setup_timeout.as_secs()
+            ))
+        }
+    };
+
+    let context = match setup_outcome {
+        Ok(context) => context,
+        Err(cause) => {
+            // Setup failed or timed out: this is a harness/helper problem, not a client
+            // defect, so say so explicitly, and report every scenario as failed too (rather
+            // than silently missing) so hiveview still lists them.
+            let scenario_count = scenarios.len();
+            for scenario in &scenarios {
+                let scenario_test_id = host_test
+                    .sim
+                    .start_test(
+                        suite_id,
+                        scenario.name.clone(),
+                        scenario.description.clone(),
+                    )
+                    .await;
+                host_test
+                    .sim
+                    .end_test(
+                        suite_id,
+                        scenario_test_id,
+                        TestResult {
+                            pass: false,
+                            details: format!(
+                                "shared post-genesis setup failed before this scenario could run \
+                                 (LeanSpec helper setup, not a client assertion). Cause: {cause}"
+                            ),
+                        },
+                    )
+                    .await;
+                host_test.sim.test_progress(&suite_name);
+            }
+
+            host_test
+                .sim
+                .end_test(
+                    suite_id,
+                    owner_test_id,
+                    TestResult {
+                        pass: false,
+                        details: format!(
+                            "shared post-genesis setup failed for client {client_name}: {cause}; \
+                             0/{scenario_count} scenario(s) passed ({scenarios_filtered} filtered)"
+                        ),
+                    },
+                )
+                .await;
+            host_test.sim.test_progress(&suite_name);
+            return;
+        }
+    };
+
+    let shared_data = SharedPostGenesisData {
+        source_fork_choice: context.source_fork_choice.clone(),
+        client_checkpoint: context.client_checkpoint.clone(),
+    };
+
+    let mut scenarios_run: usize = 0;
+    let mut scenarios_passed: usize = 0;
+
+    for scenario in scenarios {
+        let scenario_test_id = host_test
+            .sim
+            .start_test(
+                suite_id,
+                scenario.name.clone(),
+                scenario.description.clone(),
+            )
+            .await;
+
+        // Registration failure fails only this scenario.
+        if let Err(err) = host_test
+            .sim
+            .register_multi_test_node(
+                suite_id,
+                owner_test_id,
+                &context.client_under_test.container,
+                scenario_test_id,
+            )
+            .await
+        {
+            host_test
+                .sim
+                .end_test(
+                    suite_id,
+                    scenario_test_id,
+                    TestResult {
+                        pass: false,
+                        details: format!(
+                            "shared post-genesis registration failed; skipping scenario: {err}"
+                        ),
+                    },
+                )
+                .await;
+            host_test.sim.test_progress(&suite_name);
+            scenarios_run += 1;
+            continue;
+        }
+
+        // Reuse the shared client's kind/container/ip/rpc, but give this scenario its own
+        // `Test` (carrying the scenario's own test_id) so results attribute correctly.
+        let scenario_client = Client {
+            test: Test {
+                sim: host_test.sim.clone(),
+                test_id: scenario_test_id,
+                suite: suite.clone(),
+                suite_id,
+                result: Default::default(),
+            },
+            ..context.client_under_test.clone()
+        };
+        let scenario_data = shared_data.clone();
+        let run = scenario.run;
+
+        let mut scenario_handle =
+            tokio::spawn(async move { (run)(scenario_client, scenario_data).await });
+
+        let test_result = match timeout(scenario_timeout, &mut scenario_handle).await {
+            Ok(join_result) => extract_data_test_result(join_result),
+            Err(_) => {
+                scenario_handle.abort();
+                scenario_handle.await.ok();
+                TestResult {
+                    pass: false,
+                    details: format!(
+                        "client {client_name}: scenario exceeded timeout of {} seconds",
+                        scenario_timeout.as_secs()
+                    ),
+                }
+            }
+        };
+
+        if test_result.pass {
+            scenarios_passed += 1;
+        }
+        host_test
+            .sim
+            .end_test(suite_id, scenario_test_id, test_result)
+            .await;
+        host_test.sim.test_progress(&suite_name);
+        scenarios_run += 1;
+    }
+
+    let owner_pass = scenarios_run > 0 && scenarios_passed == scenarios_run;
+    host_test
+        .sim
+        .end_test(
+            suite_id,
+            owner_test_id,
+            TestResult {
+                pass: owner_pass,
+                details: format!(
+                    "shared post-genesis lifecycle owner: {scenarios_passed}/{scenarios_run} \
+                     scenario(s) passed ({scenarios_filtered} filtered)"
+                ),
+            },
+        )
+        .await;
+    host_test.sim.test_progress(&suite_name);
 }
 
 async fn start_post_genesis_sync_context_inner(

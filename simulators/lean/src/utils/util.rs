@@ -586,7 +586,9 @@ pub(crate) fn lean_single_client_runtime_setup(client_type: &str) -> ClientRunti
     (Some(vec![Some(environment)]), Some(vec![Some(files)]))
 }
 
-fn extract_data_test_result(join_handle: Result<(), tokio::task::JoinError>) -> TestResult {
+pub(crate) fn extract_data_test_result(
+    join_handle: Result<(), tokio::task::JoinError>,
+) -> TestResult {
     match join_handle {
         Ok(()) => TestResult {
             pass: true,
